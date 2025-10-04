@@ -10,7 +10,7 @@ use grammers_session::Session;
 use log::{info, error};
 use simplelog::{TermLogger, ConfigBuilder, TerminalMode, ColorChoice};
 use tokio::net::TcpListener;
-use tokio::io::{AsyncWriteExt, AsyncReadExt}; // Import for socket read/write
+use tokio::io::AsyncWriteExt; // Only AsyncWriteExt is used
 
 mod bot;
 mod command;
@@ -77,9 +77,8 @@ async fn main() -> Result<()> {
 
     // Run the bot asynchronously in a spawned task
     let bot_runner = tokio::spawn(async move {
-        if let Err(e) = bot.run().await {
-            error!("Bot runner error: {}", e);
-        }
+        bot.run().await;
+        info!("Bot runner task completed");
     });
 
     // Minimal HTTP server for health checks (to keep Render happy)

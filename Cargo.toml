@@ -18,7 +18,7 @@ grammers-session = "0.7.0"
 grammers-mtsender = "0.7.0"
 log = "0.4.22"
 simplelog = "0.12.2"
-tokio = { version = "1.40.0", features = ["full"] }
+tokio = { version = "1.40.0", features = ["full"] }  # This includes net, io, etc.
 tokio-util = { version = "0.7.12", features = ["compat", "io"] }
 futures = "0.3.31"
 async-read-progress = "0.2.0"

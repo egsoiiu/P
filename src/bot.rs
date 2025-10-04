@@ -1,5 +1,5 @@
 use std::{sync::Arc, time::Duration};
-use bytes::{Bytes, BytesMut}; // Add at the top if missing
+use bytes::{Bytes, BytesMut};
 
 use anyhow::Result;
 use async_read_progress::TokioAsyncReadProgressExt;
@@ -39,9 +39,11 @@ impl Bot {
             client,
             me,
             http: reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
-            .build()?,
+                .connect_timeout(Duration::from_secs(10))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                            (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
+                .redirect(reqwest::redirect::Policy::limited(10)) // Enable redirects
+                .build()?,
             locks: Arc::new(DashSet::new()),
             started_by: Arc::new(DashMap::new()),
             triggers: Arc::new(DashMap::new()),
@@ -60,7 +62,6 @@ impl Bot {
                 Ok(update) = self.client.next_update() => {
                     let self_ = self.clone();
 
-                    // Spawn a new task to handle the update
                     tokio::spawn(async move {
                         if let Err(err) = self_.handle_update(update).await {
                             error!("Error handling update: {}", err);
@@ -73,7 +74,6 @@ impl Bot {
 
     /// Update handler.
     async fn handle_update(&self, update: Update) -> Result<()> {
-        // NOTE: no ; here, so result is returned
         match update {
             Update::NewMessage(msg) => self.handle_message(msg).await,
             Update::CallbackQuery(query) => self.handle_callback(query).await,
@@ -82,20 +82,14 @@ impl Bot {
     }
 
     /// Message handler.
-    ///
-    /// Ensures the message is from a user or a group, and then parses the command.
-    /// If the command is not recognized, it will try to parse the message as a URL.
     async fn handle_message(&self, msg: Message) -> Result<()> {
-        // Ensure the message chat is a user or a group
         match msg.chat() {
             Chat::User(_) | Chat::Group(_) => {}
             _ => return Ok(()),
         };
 
-        // Parse the command
         let command = parse_command(msg.text());
         if let Some(command) = command {
-            // Ensure the command is for this bot
             if let Some(via) = &command.via {
                 if via.to_lowercase() != self.me.username().unwrap_or_default().to_lowercase() {
                     warn!("Ignoring command for unknown bot: {}", via);
@@ -103,16 +97,12 @@ impl Bot {
                 }
             }
 
-            // There is a chance that there are multiple bots listening
-            // to /start commands in a group, so we handle commands
-            // only if they are sent explicitly to this bot.
             if let Chat::Group(_) = msg.chat() {
                 if command.name == "start" && command.via.is_none() {
                     return Ok(());
                 }
             }
 
-            // Handle the command
             info!("Received command: {:?}", command);
             match command.name.as_str() {
                 "start" => {
@@ -126,7 +116,6 @@ impl Bot {
         }
 
         if let Chat::User(_) = msg.chat() {
-            // If the message is not a command, try to parse it as a URL
             if let Ok(url) = Url::parse(msg.text()) {
                 return self.handle_url(msg, url).await;
             }
@@ -136,8 +125,6 @@ impl Bot {
     }
 
     /// Handle the /start command.
-    /// This command is sent when the user starts a conversation with the bot.
-    /// It will reply with a welcome message.
     async fn handle_start(&self, msg: Message) -> Result<()> {
         msg.reply(InputMessage::html(
             "📁 <b>Hi! Need a file uploaded? Just send the link!</b>\n\
@@ -154,9 +141,7 @@ impl Bot {
     }
 
     /// Handle the /upload command.
-    /// This command should be used in groups to upload a file.
     async fn handle_upload(&self, msg: Message, cmd: Command) -> Result<()> {
-        // If the argument is not specified, reply with an error
         let url = match cmd.arg {
             Some(url) => url,
             None => {
@@ -165,7 +150,6 @@ impl Bot {
             }
         };
 
-        // Parse the URL
         let url = match Url::parse(&url) {
             Ok(url) => url,
             Err(err) => {
@@ -178,179 +162,172 @@ impl Bot {
     }
 
     /// Handle a URL.
-    /// This function will download the file and upload it to Telegram.
-/// Handle a URL.
-/// This function will download the file and upload it to Telegram.
-async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
-    let sender = match msg.sender() {
-        Some(sender) => sender,
-        None => return Ok(()),
-    };
+    async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
+        let sender = match msg.sender() {
+            Some(sender) => sender,
+            None => return Ok(()),
+        };
 
-    // Lock the chat to prevent multiple uploads at the same time
-    info!("Locking chat {}", msg.chat().id());
-    let _lock = self.locks.insert(msg.chat().id());
-    if !_lock {
-        msg.reply("✋ Whoa, slow down! There's already an active upload in this chat.")
-            .await?;
-        return Ok(());
-    }
-    self.started_by.insert(msg.chat().id(), sender.id());
+        info!("Locking chat {}", msg.chat().id());
+        let _lock = self.locks.insert(msg.chat().id());
+        if !_lock {
+            msg.reply("✋ Whoa, slow down! There's already an active upload in this chat.")
+                .await?;
+            return Ok(());
+        }
+        self.started_by.insert(msg.chat().id(), sender.id());
 
-    // Deferred unlock
-    defer! {
-        info!("Unlocking chat {}", msg.chat().id());
-        self.locks.remove(&msg.chat().id());
-        self.started_by.remove(&msg.chat().id());
-    };
+        defer! {
+            info!("Unlocking chat {}", msg.chat().id());
+            self.locks.remove(&msg.chat().id());
+            self.started_by.remove(&msg.chat().id());
+        };
 
-    info!("Downloading file from {}", url);
-    let response = self.http.get(url.clone()).send().await?;
+        info!("Downloading file from {}", url);
 
-    // 🛠 Extract data BEFORE moving response
-    let headers = response.headers().clone();
-    let final_url = response.url().clone();
-    let content_length = response.content_length().unwrap_or_default() as usize;
-    let content_disposition = headers.get("content-disposition").cloned();
-    let content_type = headers
-        .get("content-type")
-        .and_then(|ct| ct.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
+        let response = self.http.get(url.clone()).send().await?;
 
-    // 🧠 Derive filename
-    let name = match content_disposition
-        .as_ref()
-        .and_then(|value| {
-            value
-                .to_str()
-                .ok()
-                .and_then(|v| v.split(';').map(|v| v.trim()).find(|v| v.starts_with("filename=")))
-                .map(|v| v.trim_start_matches("filename="))
-                .map(|v| v.trim_matches('"'))
-        }) {
-        Some(name) => name.to_string(),
-        None => final_url
-            .path_segments()
-            .and_then(|segments| segments.last())
-            .and_then(|name| {
-                if name.contains('.') {
-                    Some(name.to_string())
-                } else {
-                    mime_guess::get_mime_extensions_str(&content_type)
-                        .and_then(|exts| exts.first())
-                        .map(|ext| format!("{}.{}", name, ext))
-                }
-            })
-            .unwrap_or("file.bin".to_string()),
-    };
+        if !response.status().is_success() {
+            msg.reply(format!("Failed to download file: HTTP {}", response.status()))
+                .await?;
+            return Ok(());
+        }
 
-    let name = percent_encoding::percent_decode_str(&name)
-        .decode_utf8()?
-        .to_string();
+        let headers = response.headers().clone();
+        let final_url = response.url().clone();
+        let content_length = response.content_length().unwrap_or(0) as usize;
+        let content_disposition = headers.get("content-disposition").cloned();
+        let content_type = headers
+            .get("content-type")
+            .and_then(|ct| ct.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
 
-    let is_video = content_type.starts_with("video/mp4") || name.to_lowercase().ends_with(".mp4");
+        let name = match content_disposition
+            .as_ref()
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|v| v.split(';').map(|v| v.trim()).find(|v| v.starts_with("filename=")))
+                    .map(|v| v.trim_start_matches("filename="))
+                    .map(|v| v.trim_matches('"'))
+            }) {
+            Some(name) => name.to_string(),
+            None => final_url
+                .path_segments()
+                .and_then(|segments| segments.last())
+                .and_then(|name| {
+                    if name.contains('.') {
+                        Some(name.to_string())
+                    } else {
+                        mime_guess::get_mime_extensions_str(&content_type)
+                            .and_then(|exts| exts.first())
+                            .map(|ext| format!("{}.{}", name, ext))
+                    }
+                })
+                .unwrap_or_else(|| "file.bin".to_string()),
+        };
 
-    info!("File {} ({} bytes, video: {})", name, content_length, is_video);
+        let name = percent_encoding::percent_decode_str(&name).decode_utf8()?.to_string();
 
-    // Empty file check
-    if content_length == 0 {
-        msg.reply("⚠️ File is empty").await?;
-        return Ok(());
-    }
+        let is_video = content_type.starts_with("video/mp4") || name.to_lowercase().ends_with(".mp4");
 
-    // File too large check
-    if content_length > 2 * 1024 * 1024 * 1024 {
-        msg.reply("⚠️ File is too large").await?;
-        return Ok(());
-    }
+        info!("File {} ({} bytes, video: {})", name, content_length, is_video);
 
-    // 🔁 Consume the response into stream
-    let (trigger, stream) = Valved::new(
-        response
-            .bytes_stream()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
-    );
-    self.triggers.insert(msg.chat().id(), trigger);
+        if content_length == 0 {
+            let body_bytes = response.bytes().await?;
+            if body_bytes.is_empty() {
+                msg.reply("⚠️ File is empty").await?;
+                return Ok(());
+            }
+        }
 
-    // Deferred trigger removal
-    defer! {
-        self.triggers.remove(&msg.chat().id());
-    };
+        if content_length > 2 * 1024 * 1024 * 1024 {
+            msg.reply("⚠️ File is too large").await?;
+            return Ok(());
+        }
 
-    let reply_markup = Arc::new(reply_markup::inline(vec![vec![button::inline(
-        "⛔ Cancel",
-        "cancel",
-    )]]));
+        let (trigger, stream) = Valved::new(
+            response
+                .bytes_stream()
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
+        );
+        self.triggers.insert(msg.chat().id(), trigger);
 
-    // Send status message
-    let status = Arc::new(Mutex::new(
-        msg.reply(
-            InputMessage::html(format!("🚀 Starting upload of <code>{}</code>...", name))
-                .reply_markup(reply_markup.clone().as_ref()),
-        )
-        .await?,
-    ));
+        defer! {
+            self.triggers.remove(&msg.chat().id());
+        };
 
-    let mut stream = stream
-        .into_async_read()
-        .compat()
-        .report_progress(Duration::from_secs(3), |progress| {
-            let status = status.clone();
-            let name = name.clone();
-            let reply_markup = reply_markup.clone();
-            tokio::spawn(async move {
-                status
-                    .lock()
-                    .await
-                    .edit(
-                        InputMessage::html(format!(
-                            "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
-                             <i>{} / {}</i>",
-                            name,
-                            progress as f64 / content_length as f64 * 100.0,
-                            bytesize::to_string(progress as u64, true),
-                            bytesize::to_string(content_length as u64, true),
-                        ))
-                        .reply_markup(reply_markup.as_ref()),
-                    )
-                    .await
-                    .ok();
+        let reply_markup = Arc::new(reply_markup::inline(vec![vec![button::inline(
+            "⛔ Cancel",
+            "cancel",
+        )]]));
+
+        let status = Arc::new(Mutex::new(
+            msg.reply(
+                InputMessage::html(format!("🚀 Starting upload of <code>{}</code>...", name))
+                    .reply_markup(reply_markup.clone().as_ref()),
+            )
+            .await?,
+        ));
+
+        let mut stream = stream
+            .into_async_read()
+            .compat()
+            .report_progress(Duration::from_secs(3), |progress| {
+                let status = status.clone();
+                let name = name.clone();
+                let reply_markup = reply_markup.clone();
+                tokio::spawn(async move {
+                    status
+                        .lock()
+                        .await
+                        .edit(
+                            InputMessage::html(format!(
+                                "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
+                                 <i>{} / {}</i>",
+                                name,
+                                progress as f64 / content_length as f64 * 100.0,
+                                bytesize::to_string(progress as u64, true),
+                                bytesize::to_string(content_length as u64, true),
+                            ))
+                            .reply_markup(reply_markup.as_ref()),
+                        )
+                        .await
+                        .ok();
+                });
             });
-        });
 
-    // Upload file to Telegram
-    let start_time = chrono::Utc::now();
-    let file = self
-        .client
-        .upload_stream(&mut stream, content_length, name.clone())
-        .await?;
+        let start_time = chrono::Utc::now();
+        let file = self
+            .client
+            .upload_stream(&mut stream, content_length, name.clone())
+            .await?;
 
-    // Done, show summary
-    let elapsed = chrono::Utc::now() - start_time;
-    info!("Uploaded file {} ({} bytes) in {}", name, content_length, elapsed);
+        let elapsed = chrono::Utc::now() - start_time;
+        info!("Uploaded file {} ({} bytes) in {}", name, content_length, elapsed);
 
-    let mut input_msg = InputMessage::html(format!(
-        "Uploaded in <b>{:.2} secs</b>",
-        elapsed.num_milliseconds() as f64 / 1000.0
-    ));
-    input_msg = input_msg.document(file);
-    if is_video {
-        input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
-            supports_streaming: false,
-            duration: Duration::ZERO,
-            w: 0,
-            h: 0,
-            round_message: false,
-        });
+        let mut input_msg = InputMessage::html(format!(
+            "Uploaded in <b>{:.2} secs</b>",
+            elapsed.num_milliseconds() as f64 / 1000.0
+        ));
+        input_msg = input_msg.document(file);
+        if is_video {
+            input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
+                supports_streaming: false,
+                duration: Duration::ZERO,
+                w: 0,
+                h: 0,
+                round_message: false,
+            });
+        }
+        msg.reply(input_msg).await?;
+
+        status.lock().await.delete().await?;
+
+        Ok(())
     }
-    msg.reply(input_msg).await?;
-
-    // Delete status message
-    status.lock().await.delete().await?;
-
-    Ok(())
-}
 
     /// Callback query handler.
     async fn handle_callback(&self, query: CallbackQuery) -> Result<()> {
@@ -369,7 +346,7 @@ async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
 
         if started_by_user_id != query.sender().id() {
             info!(
-                "Some genius with ID {} tried to cancel another user's upload in chat {}",
+                "User ID {} tried to cancel another user's upload in chat {}",
                 query.sender().id(),
                 query.chat().id()
             );

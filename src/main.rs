@@ -10,6 +10,7 @@ use grammers_session::Session;
 use log::{info, error};
 use simplelog::{TermLogger, ConfigBuilder, TerminalMode, ColorChoice};
 use tokio::net::TcpListener;
+use tokio::io::{AsyncWriteExt, AsyncReadExt}; // Import for socket read/write
 
 mod bot;
 mod command;
@@ -68,33 +69,34 @@ async fn main() -> Result<()> {
     // Start HTTP health check server for Render
     let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let port = port.parse::<u16>().unwrap_or(8080);
-    
+
     let listener = TcpListener::bind(("0.0.0.0", port)).await
         .with_context(|| format!("Failed to bind to port {}", port))?;
-    
+
     info!("Health check server listening on port {}", port);
 
+    // Run the bot asynchronously in a spawned task
     let bot_runner = tokio::spawn(async move {
         if let Err(e) = bot.run().await {
             error!("Bot runner error: {}", e);
         }
     });
 
-    // Minimal HTTP server for health checks
+    // Minimal HTTP server for health checks (to keep Render happy)
     let http_server = tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((mut socket, addr)) => {
                     info!("Health check from {}", addr);
-                    
+
                     tokio::spawn(async move {
-                        let response = 
+                        let response =
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: text/plain\r\n\
                              Content-Length: 2\r\n\
                              \r\n\
                              OK";
-                        
+
                         if let Err(e) = socket.write_all(response.as_bytes()).await {
                             error!("Failed to write health response to {}: {}", addr, e);
                         }

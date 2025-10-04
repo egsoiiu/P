@@ -178,190 +178,200 @@ impl Bot {
 
     /// Handle a URL.
     /// This function will download the file and upload it to Telegram.
-    async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
-        let sender = match msg.sender() {
-            Some(sender) => sender,
-            None => return Ok(()),
-        };
+async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
+    let sender = match msg.sender() {
+        Some(sender) => sender,
+        None => return Ok(()),
+    };
 
-        // Lock the chat to prevent multiple uploads at the same time
-        info!("Locking chat {}", msg.chat().id());
-        let _lock = self.locks.insert(msg.chat().id());
-        if !_lock {
-            msg.reply("✋ Whoa, slow down! There's already an active upload in this chat.")
-                .await?;
-            return Ok(());
-        }
-        self.started_by.insert(msg.chat().id(), sender.id());
-
-        // Deferred unlock
-        defer! {
-            info!("Unlocking chat {}", msg.chat().id());
-            self.locks.remove(&msg.chat().id());
-            self.started_by.remove(&msg.chat().id());
-        };
-
-        info!("Downloading file from {}", url);
-        let response = self.http.get(url).send().await?;
-
-        // Get the file name and size
-        let length = response.content_length().unwrap_or_default() as usize;
-        let name = match response
-            .headers()
-            .get("content-disposition")
-            .and_then(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .split(';')
-                            .map(|value| value.trim())
-                            .find(|value| value.starts_with("filename="))
-                    })
-                    .map(|value| value.trim_start_matches("filename="))
-                    .map(|value| value.trim_matches('"'))
-            }) {
-            Some(name) => name.to_string(),
-            None => response
-                .url()
-                .path_segments()
-                .and_then(|segments| segments.last())
-                .and_then(|name| {
-                    if name.contains('.') {
-                        Some(name.to_string())
-                    } else {
-                        // guess the extension from the content type
-                        response
-                            .headers()
-                            .get("content-type")
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(mime_guess::get_mime_extensions_str)
-                            .and_then(|ext| ext.first())
-                            .map(|ext| format!("{}.{}", name, ext))
-                    }
-                })
-                .unwrap_or("file.bin".to_string())
-                .to_string(),
-        };
-        let name = percent_encoding::percent_decode_str(&name)
-            .decode_utf8()?
-            .to_string();
-        let is_video = response
-            .headers()
-            .get("content-type")
-            .map(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| value.starts_with("video/mp4"))
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
-            || name.to_lowercase().ends_with(".mp4");
-        info!("File {} ({} bytes, video: {})", name, length, is_video);
-
-        // File is empty
-        if length == 0 {
-            msg.reply("⚠️ File is empty").await?;
-            return Ok(());
-        }
-
-        // File is too large
-        if length > 2 * 1024 * 1024 * 1024 {
-            msg.reply("⚠️ File is too large").await?;
-            return Ok(());
-        }
-
-        // Wrap the response stream in a valved stream
-        let (trigger, stream) = Valved::new(
-            response
-                .bytes_stream()
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
-        );
-        self.triggers.insert(msg.chat().id(), trigger);
-
-        // Deferred trigger removal
-        defer! {
-            self.triggers.remove(&msg.chat().id());
-        };
-
-        // Reply markup buttons
-        let reply_markup = Arc::new(reply_markup::inline(vec![vec![button::inline(
-            "⛔ Cancel",
-            "cancel",
-        )]]));
-
-        // Send status message
-        let status = Arc::new(Mutex::new(
-            msg.reply(
-                InputMessage::html(format!("🚀 Starting upload of <code>{}</code>...", name))
-                    .reply_markup(reply_markup.clone().as_ref()),
-            )
-            .await?,
-        ));
-
-        let mut stream = stream
-            .into_async_read()
-            .compat()
-            // Report progress every 3 seconds
-            .report_progress(Duration::from_secs(3), |progress| {
-                let status = status.clone();
-                let name = name.clone();
-                let reply_markup = reply_markup.clone();
-                tokio::spawn(async move {
-                    status
-                        .lock()
-                        .await
-                        .edit(
-                            InputMessage::html(format!(
-                                "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
-                            <i>{} / {}</i>",
-                                name,
-                                progress as f64 / length as f64 * 100.0,
-                                bytesize::to_string(progress as u64, true),
-                                bytesize::to_string(length as u64, true),
-                            ))
-                            .reply_markup(reply_markup.as_ref()),
-                        )
-                        .await
-                        .ok();
-                });
-            });
-
-        // Upload the file
-        let start_time = chrono::Utc::now();
-        let file = self
-            .client
-            .upload_stream(&mut stream, length, name.clone())
+    // Lock the chat to prevent multiple uploads at the same time
+    info!("Locking chat {}", msg.chat().id());
+    let _lock = self.locks.insert(msg.chat().id());
+    if !_lock {
+        msg.reply("✋ Whoa, slow down! There's already an active upload in this chat.")
             .await?;
-
-        // Calculate upload time
-        let elapsed = chrono::Utc::now() - start_time;
-        info!("Uploaded file {} ({} bytes) in {}", name, length, elapsed);
-
-        // Send file
-        let mut input_msg = InputMessage::html(format!(
-            "Uploaded in <b>{:.2} secs</b>",
-            elapsed.num_milliseconds() as f64 / 1000.0
-        ));
-        input_msg = input_msg.document(file);
-        if is_video {
-            input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
-                supports_streaming: false,
-                duration: Duration::ZERO,
-                w: 0,
-                h: 0,
-                round_message: false,
-            });
-        }
-        msg.reply(input_msg).await?;
-
-        // Delete status message
-        status.lock().await.delete().await?;
-
-        Ok(())
+        return Ok(());
     }
+    self.started_by.insert(msg.chat().id(), sender.id());
+
+    // Deferred unlock
+    defer! {
+        info!("Unlocking chat {}", msg.chat().id());
+        self.locks.remove(&msg.chat().id());
+        self.started_by.remove(&msg.chat().id());
+    };
+
+    info!("Downloading file from {}", url);
+    let response = self.http.get(url).send().await?;
+
+    // Get the file name
+    let name = match response
+        .headers()
+        .get("content-disposition")
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| {
+                    value
+                        .split(';')
+                        .map(|value| value.trim())
+                        .find(|value| value.starts_with("filename="))
+                })
+                .map(|value| value.trim_start_matches("filename="))
+                .map(|value| value.trim_matches('"'))
+        }) {
+        Some(name) => name.to_string(),
+        None => response
+            .url()
+            .path_segments()
+            .and_then(|segments| segments.last())
+            .and_then(|name| {
+                if name.contains('.') {
+                    Some(name.to_string())
+                } else {
+                    // guess the extension from the content type
+                    response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(mime_guess::get_mime_extensions_str)
+                        .and_then(|ext| ext.first())
+                        .map(|ext| format!("{}.{}", name, ext))
+                }
+            })
+            .unwrap_or("file.bin".to_string())
+            .to_string(),
+    };
+    let name = percent_encoding::percent_decode_str(&name)
+        .decode_utf8()?
+        .to_string();
+
+    // Buffer the entire response to get real length
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buffer.extend_from_slice(&chunk);
+    }
+    let length = buffer.len();
+
+    let is_video = response
+        .headers()
+        .get("content-type")
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| value.starts_with("video/mp4"))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+        || name.to_lowercase().ends_with(".mp4");
+
+    info!("File {} ({} bytes, video: {})", name, length, is_video);
+
+    // File is empty
+    if length == 0 {
+        msg.reply("⚠️ File is empty").await?;
+        return Ok(());
+    }
+
+    // File is too large
+    if length > 2 * 1024 * 1024 * 1024 {
+        msg.reply("⚠️ File is too large").await?;
+        return Ok(());
+    }
+
+    // Wrap the buffer in an async reader, then stream for upload
+    let reader = tokio::io::BufReader::new(buffer.as_slice());
+    let stream = tokio_util::io::ReaderStream::new(reader)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
+    let (trigger, valved_stream) = Valved::new(stream);
+    self.triggers.insert(msg.chat().id(), trigger);
+
+    // Deferred trigger removal
+    defer! {
+        self.triggers.remove(&msg.chat().id());
+    };
+
+    // Reply markup buttons
+    let reply_markup = Arc::new(reply_markup::inline(vec![vec![button::inline(
+        "⛔ Cancel",
+        "cancel",
+    )]]));
+
+    // Send status message
+    let status = Arc::new(Mutex::new(
+        msg.reply(
+            InputMessage::html(format!("🚀 Starting upload of <code>{}</code>...", name))
+                .reply_markup(reply_markup.clone().as_ref()),
+        )
+        .await?,
+    ));
+
+    let mut stream = valved_stream
+        .into_async_read()
+        .compat()
+        // Report progress every 3 seconds
+        .report_progress(Duration::from_secs(3), |progress| {
+            let status = status.clone();
+            let name = name.clone();
+            let reply_markup = reply_markup.clone();
+            tokio::spawn(async move {
+                status
+                    .lock()
+                    .await
+                    .edit(
+                        InputMessage::html(format!(
+                            "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
+                        <i>{} / {}</i>",
+                            name,
+                            progress as f64 / length as f64 * 100.0,
+                            bytesize::to_string(progress as u64, true),
+                            bytesize::to_string(length as u64, true),
+                        ))
+                        .reply_markup(reply_markup.as_ref()),
+                    )
+                    .await
+                    .ok();
+            });
+        });
+
+    // Upload the file
+    let start_time = chrono::Utc::now();
+    let file = self
+        .client
+        .upload_stream(&mut stream, length, name.clone())
+        .await?;
+
+    // Calculate upload time
+    let elapsed = chrono::Utc::now() - start_time;
+    info!("Uploaded file {} ({} bytes) in {}", name, length, elapsed);
+
+    // Send file
+    let mut input_msg = InputMessage::html(format!(
+        "Uploaded in <b>{:.2} secs</b>",
+        elapsed.num_milliseconds() as f64 / 1000.0
+    ));
+    input_msg = input_msg.document(file);
+    if is_video {
+        input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
+            supports_streaming: false,
+            duration: Duration::ZERO,
+            w: 0,
+            h: 0,
+            round_message: false,
+        });
+    }
+    msg.reply(input_msg).await?;
+
+    // Delete status message
+    status.lock().await.delete().await?;
+
+    Ok(())
+}
 
     /// Callback query handler.
     async fn handle_callback(&self, query: CallbackQuery) -> Result<()> {

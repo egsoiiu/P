@@ -179,190 +179,178 @@ impl Bot {
 
     /// Handle a URL.
     /// This function will download the file and upload it to Telegram.
-    async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
-        let sender = match msg.sender() {
-            Some(sender) => sender,
-            None => return Ok(()),
-        };
+/// Handle a URL.
+/// This function will download the file and upload it to Telegram.
+async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
+    let sender = match msg.sender() {
+        Some(sender) => sender,
+        None => return Ok(()),
+    };
 
-        // Lock the chat to prevent multiple uploads at the same time
-        info!("Locking chat {}", msg.chat().id());
-        let _lock = self.locks.insert(msg.chat().id());
-        if !_lock {
-            msg.reply("✋ Whoa, slow down! There's already an active upload in this chat.")
-                .await?;
-            return Ok(());
-        }
-        self.started_by.insert(msg.chat().id(), sender.id());
+    // Lock the chat to prevent multiple uploads at the same time
+    info!("Locking chat {}", msg.chat().id());
+    let _lock = self.locks.insert(msg.chat().id());
+    if !_lock {
+        msg.reply("✋ Whoa, slow down! There's already an active upload in this chat.")
+            .await?;
+        return Ok(());
+    }
+    self.started_by.insert(msg.chat().id(), sender.id());
 
-        // Deferred unlock
-        defer! {
-            info!("Unlocking chat {}", msg.chat().id());
-            self.locks.remove(&msg.chat().id());
-            self.started_by.remove(&msg.chat().id());
-        };
+    // Deferred unlock
+    defer! {
+        info!("Unlocking chat {}", msg.chat().id());
+        self.locks.remove(&msg.chat().id());
+        self.started_by.remove(&msg.chat().id());
+    };
 
-        info!("Downloading file from {}", url);
-        let response = self.http.get(url.clone()).send().await?;
+    info!("Downloading file from {}", url);
+    let response = self.http.get(url.clone()).send().await?;
 
-        // Read the file into memory and count the size
-        let mut total_bytes: usize = 0;
-        let mut chunks = response.bytes_stream();
-        let mut buffer_parts: Vec<bytes::Bytes> = Vec::new();
+    // 🛠 Extract data BEFORE moving response
+    let headers = response.headers().clone();
+    let final_url = response.url().clone();
+    let content_length = response.content_length().unwrap_or_default() as usize;
+    let content_disposition = headers.get("content-disposition").cloned();
+    let content_type = headers
+        .get("content-type")
+        .and_then(|ct| ct.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
 
-        while let Some(chunk) = chunks.try_next().await? {
-            total_bytes += chunk.len();
-            buffer_parts.push(chunk);
-        }
-
-        if total_bytes == 0 {
-            msg.reply("⚠️ File is empty").await?;
-            return Ok(());
-        }
-
-        if total_bytes > 2 * 1024 * 1024 * 1024 {
-            msg.reply("⚠️ File is too large").await?;
-            return Ok(());
-        }
-
-        let full_bytes = buffer_parts
-            .into_iter()
-            .fold(bytes::BytesMut::new(), |mut acc, part| {
-                acc.extend_from_slice(&part);
-                acc
+    // 🧠 Derive filename
+    let name = match content_disposition
+        .as_ref()
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|v| v.split(';').map(|v| v.trim()).find(|v| v.starts_with("filename=")))
+                .map(|v| v.trim_start_matches("filename="))
+                .map(|v| v.trim_matches('"'))
+        }) {
+        Some(name) => name.to_string(),
+        None => final_url
+            .path_segments()
+            .and_then(|segments| segments.last())
+            .and_then(|name| {
+                if name.contains('.') {
+                    Some(name.to_string())
+                } else {
+                    mime_guess::get_mime_extensions_str(&content_type)
+                        .and_then(|exts| exts.first())
+                        .map(|ext| format!("{}.{}", name, ext))
+                }
             })
-            .freeze();
+            .unwrap_or("file.bin".to_string()),
+    };
 
-        let mut reader = &full_bytes[..];
+    let name = percent_encoding::percent_decode_str(&name)
+        .decode_utf8()?
+        .to_string();
 
-        // Determine filename
-        let name = match response
-            .headers()
-            .get("content-disposition")
-            .and_then(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .split(';')
-                            .map(|value| value.trim())
-                            .find(|value| value.starts_with("filename="))
-                    })
-                    .map(|value| value.trim_start_matches("filename="))
-                    .map(|value| value.trim_matches('"'))
-            }) {
-            Some(name) => name.to_string(),
-            None => url
-                .path_segments()
-                .and_then(|segments| segments.last())
-                .unwrap_or("file.bin")
-                .to_string(),
-        };
+    let is_video = content_type.starts_with("video/mp4") || name.to_lowercase().ends_with(".mp4");
 
-        let name = percent_encoding::percent_decode_str(&name)
-            .decode_utf8()?
-            .to_string();
+    info!("File {} ({} bytes, video: {})", name, content_length, is_video);
 
-        let is_video = name.to_lowercase().ends_with(".mp4");
+    // Empty file check
+    if content_length == 0 {
+        msg.reply("⚠️ File is empty").await?;
+        return Ok(());
+    }
 
-        info!(
-            "Prepared file {} ({} bytes, video: {})",
-            name, total_bytes, is_video
-        );
+    // File too large check
+    if content_length > 2 * 1024 * 1024 * 1024 {
+        msg.reply("⚠️ File is too large").await?;
+        return Ok(());
+    }
 
-        // Reply markup buttons
-        let reply_markup = Arc::new(reply_markup::inline(vec![vec![button::inline(
-            "⛔ Cancel",
-            "cancel",
-        )]]));
+    // 🔁 Consume the response into stream
+    let (trigger, stream) = Valved::new(
+        response
+            .bytes_stream()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
+    );
+    self.triggers.insert(msg.chat().id(), trigger);
 
-        // Send status message
-        let status = Arc::new(Mutex::new(
-            msg.reply(
-                InputMessage::html(format!("🚀 Starting upload of <code>{}</code>...", name))
-                    .reply_markup(reply_markup.clone().as_ref()),
-            )
-            .await?,
-        ));
+    // Deferred trigger removal
+    defer! {
+        self.triggers.remove(&msg.chat().id());
+    };
 
-        // Progress reporting (manual since stream isn't used)
-        let update_interval = Duration::from_secs(3);
-        let progress_task = {
+    let reply_markup = Arc::new(reply_markup::inline(vec![vec![button::inline(
+        "⛔ Cancel",
+        "cancel",
+    )]]));
+
+    // Send status message
+    let status = Arc::new(Mutex::new(
+        msg.reply(
+            InputMessage::html(format!("🚀 Starting upload of <code>{}</code>...", name))
+                .reply_markup(reply_markup.clone().as_ref()),
+        )
+        .await?,
+    ));
+
+    let mut stream = stream
+        .into_async_read()
+        .compat()
+        .report_progress(Duration::from_secs(3), |progress| {
             let status = status.clone();
             let name = name.clone();
             let reply_markup = reply_markup.clone();
-            let total = total_bytes;
-            let uploaded = Arc::new(Mutex::new(0usize));
-            let uploaded_clone = uploaded.clone();
-
             tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(update_interval).await;
-                    let uploaded = *uploaded_clone.lock().await;
-
-                    if uploaded >= total {
-                        break;
-                    }
-
-                    let _ = status
-                        .lock()
-                        .await
-                        .edit(
-                            InputMessage::html(format!(
-                                "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
-                                <i>{} / {}</i>",
-                                name,
-                                uploaded as f64 / total as f64 * 100.0,
-                                bytesize::to_string(uploaded as u64, true),
-                                bytesize::to_string(total as u64, true),
-                            ))
-                            .reply_markup(reply_markup.as_ref()),
-                        )
-                        .await;
-                }
+                status
+                    .lock()
+                    .await
+                    .edit(
+                        InputMessage::html(format!(
+                            "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
+                             <i>{} / {}</i>",
+                            name,
+                            progress as f64 / content_length as f64 * 100.0,
+                            bytesize::to_string(progress as u64, true),
+                            bytesize::to_string(content_length as u64, true),
+                        ))
+                        .reply_markup(reply_markup.as_ref()),
+                    )
+                    .await
+                    .ok();
             });
+        });
 
-            uploaded
-        };
+    // Upload file to Telegram
+    let start_time = chrono::Utc::now();
+    let file = self
+        .client
+        .upload_stream(&mut stream, content_length, name.clone())
+        .await?;
 
-        // Upload the file
-        let start_time = chrono::Utc::now();
-        let file = self
-            .client
-            .upload_stream(&mut reader, total_bytes, name.clone())
-            .await?;
+    // Done, show summary
+    let elapsed = chrono::Utc::now() - start_time;
+    info!("Uploaded file {} ({} bytes) in {}", name, content_length, elapsed);
 
-        // Finish progress
-        *progress_task.lock().await = total_bytes;
-
-        let elapsed = chrono::Utc::now() - start_time;
-        info!("Uploaded file {} ({} bytes) in {}", name, total_bytes, elapsed);
-
-        // Send file to Telegram
-        let mut input_msg = InputMessage::html(format!(
-            "✅ Uploaded in <b>{:.2} secs</b>",
-            elapsed.num_milliseconds() as f64 / 1000.0
-        ))
-        .document(file);
-
-        if is_video {
-            input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
-                supports_streaming: false,
-                duration: Duration::ZERO,
-                w: 0,
-                h: 0,
-                round_message: false,
-            });
-        }
-
-        msg.reply(input_msg).await?;
-
-        // Delete status message
-        status.lock().await.delete().await?;
-
-        Ok(())
+    let mut input_msg = InputMessage::html(format!(
+        "Uploaded in <b>{:.2} secs</b>",
+        elapsed.num_milliseconds() as f64 / 1000.0
+    ));
+    input_msg = input_msg.document(file);
+    if is_video {
+        input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
+            supports_streaming: false,
+            duration: Duration::ZERO,
+            w: 0,
+            h: 0,
+            round_message: false,
+        });
     }
+    msg.reply(input_msg).await?;
+
+    // Delete status message
+    status.lock().await.delete().await?;
+
+    Ok(())
+}
 
     /// Callback query handler.
     async fn handle_callback(&self, query: CallbackQuery) -> Result<()> {

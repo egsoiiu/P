@@ -176,8 +176,8 @@ impl Bot {
         self.handle_url(msg, url).await
     }
 
-    /// Handle a URL.
-    /// This function will download the file and upload it to Telegram.
+/// Handle a URL.
+/// This function will download the file and upload it to Telegram.
 async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
     let sender = match msg.sender() {
         Some(sender) => sender,
@@ -202,9 +202,47 @@ async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
     };
 
     info!("Downloading file from {}", url);
-    let response = self.http.get(url).send().await?;
+    let response = match self.http.get(url.clone()).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            error!("Failed to download file from {}: {}", url, err);
+            msg.reply(format!("❌ Failed to download file: {}", err)).await?;
+            return Ok(());
+        }
+    };
 
-    // Get the file name
+    // Debug information to troubleshoot file size issues
+    info!("Final URL after redirects: {}", response.url());
+    info!("Response status: {}", response.status());
+    info!("Content-Length from reqwest: {:?}", response.content_length());
+    
+    // Log all headers for debugging
+    for (name, value) in response.headers() {
+        info!("Header: {}: {:?}", name, value);
+    }
+
+    // Check for chunked encoding
+    let is_chunked = response.headers()
+        .get("transfer-encoding")
+        .map(|v| v.to_str().unwrap_or_default().to_lowercase().contains("chunked"))
+        .unwrap_or(false);
+    info!("Is chunked encoding: {}", is_chunked);
+
+    // Get file size with multiple fallbacks
+    let length = if let Some(cl) = response.content_length() {
+        cl as usize
+    } else {
+        // Try to parse Content-Length header manually
+        response.headers()
+            .get("content-length")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    };
+
+    info!("Determined file size: {} bytes", length);
+
+    // Get the file name and size
     let name = match response
         .headers()
         .get("content-disposition")
@@ -246,17 +284,6 @@ async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
     let name = percent_encoding::percent_decode_str(&name)
         .decode_utf8()?
         .to_string();
-
-    // Buffer the entire response to get real length
-    let mut stream = response.bytes_stream();
-    let mut buffer = Vec::new();
-    use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buffer.extend_from_slice(&chunk);
-    }
-    let length = buffer.len();
-
     let is_video = response
         .headers()
         .get("content-type")
@@ -264,31 +291,37 @@ async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
             value
                 .to_str()
                 .ok()
-                .map(|value| value.starts_with("video/mp4"))
+                .map(|value| value.starts_with("video/"))
                 .unwrap_or_default()
         })
         .unwrap_or_default()
         || name.to_lowercase().ends_with(".mp4");
-
     info!("File {} ({} bytes, video: {})", name, length, is_video);
 
-    // File is empty
-    if length == 0 {
-        msg.reply("⚠️ File is empty").await?;
+    // File is empty and we're sure about it (not chunked)
+    if length == 0 && !is_chunked {
+        msg.reply("⚠️ File appears to be empty").await?;
         return Ok(());
     }
 
     // File is too large
     if length > 2 * 1024 * 1024 * 1024 {
-        msg.reply("⚠️ File is too large").await?;
+        msg.reply("⚠️ File is too large (max 2GB)").await?;
         return Ok(());
     }
 
-    // Wrap the buffer in an async reader, then stream for upload
-    let reader = tokio::io::BufReader::new(buffer.as_slice());
-    let stream = tokio_util::io::ReaderStream::new(reader)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
-    let (trigger, valved_stream) = Valved::new(stream);
+    // If we couldn't determine size, warn the user but continue
+    if length == 0 {
+        warn!("Could not determine file size for {}, file may be empty or use chunked encoding", url);
+        msg.reply("⚠️ Could not determine file size (server may use chunked encoding). Attempting download anyway...").await?;
+    }
+
+    // Wrap the response stream in a valved stream
+    let (trigger, stream) = Valved::new(
+        response
+            .bytes_stream()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
+    );
     self.triggers.insert(msg.chat().id(), trigger);
 
     // Deferred trigger removal
@@ -303,15 +336,21 @@ async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
     )]]));
 
     // Send status message
+    let status_msg = if length > 0 {
+        format!("🚀 Starting upload of <code>{}</code>...", name)
+    } else {
+        format!("🚀 Starting upload of <code>{}</code> (size unknown)...", name)
+    };
+    
     let status = Arc::new(Mutex::new(
         msg.reply(
-            InputMessage::html(format!("🚀 Starting upload of <code>{}</code>...", name))
+            InputMessage::html(status_msg)
                 .reply_markup(reply_markup.clone().as_ref()),
         )
         .await?,
     ));
 
-    let mut stream = valved_stream
+    let mut stream = stream
         .into_async_read()
         .compat()
         // Report progress every 3 seconds
@@ -320,19 +359,30 @@ async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
             let name = name.clone();
             let reply_markup = reply_markup.clone();
             tokio::spawn(async move {
+                let progress_text = if length > 0 {
+                    format!(
+                        "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
+                        <i>{} / {}</i>",
+                        name,
+                        progress as f64 / length as f64 * 100.0,
+                        bytesize::to_string(progress as u64, true),
+                        bytesize::to_string(length as u64, true),
+                    )
+                } else {
+                    format!(
+                        "⏳ Uploading <code>{}</code>\n\
+                        <i>{}</i>",
+                        name,
+                        bytesize::to_string(progress as u64, true),
+                    )
+                };
+                
                 status
                     .lock()
                     .await
                     .edit(
-                        InputMessage::html(format!(
-                            "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
-                        <i>{} / {}</i>",
-                            name,
-                            progress as f64 / length as f64 * 100.0,
-                            bytesize::to_string(progress as u64, true),
-                            bytesize::to_string(length as u64, true),
-                        ))
-                        .reply_markup(reply_markup.as_ref()),
+                        InputMessage::html(progress_text)
+                            .reply_markup(reply_markup.as_ref()),
                     )
                     .await
                     .ok();
@@ -341,10 +391,18 @@ async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
 
     // Upload the file
     let start_time = chrono::Utc::now();
-    let file = self
+    let file = match self
         .client
         .upload_stream(&mut stream, length, name.clone())
-        .await?;
+        .await
+    {
+        Ok(file) => file,
+        Err(err) => {
+            error!("Failed to upload file {}: {}", name, err);
+            status.lock().await.edit(InputMessage::html("❌ Upload failed")).await?;
+            return Ok(());
+        }
+    };
 
     // Calculate upload time
     let elapsed = chrono::Utc::now() - start_time;
@@ -352,7 +410,7 @@ async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
 
     // Send file
     let mut input_msg = InputMessage::html(format!(
-        "Uploaded in <b>{:.2} secs</b>",
+        "✅ Uploaded in <b>{:.2} secs</b>",
         elapsed.num_milliseconds() as f64 / 1000.0
     ));
     input_msg = input_msg.document(file);
@@ -372,6 +430,8 @@ async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
 
     Ok(())
 }
+
+
 
     /// Callback query handler.
     async fn handle_callback(&self, query: CallbackQuery) -> Result<()> {

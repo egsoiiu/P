@@ -7,8 +7,8 @@ use dotenv::dotenv;
 use grammers_client::{Client, Config, InitParams};
 use grammers_mtsender::{FixedReconnect, ReconnectionPolicy};
 use grammers_session::Session;
-use log::info;
-use simplelog::TermLogger;
+use log::{info, error};
+use simplelog::{TermLogger, ConfigBuilder, TerminalMode, ColorChoice};
 use tokio::net::TcpListener;
 
 mod bot;
@@ -20,30 +20,33 @@ async fn main() -> Result<()> {
 
     TermLogger::init(
         log::LevelFilter::Info,
-        simplelog::ConfigBuilder::new()
+        ConfigBuilder::new()
             .set_time_format_rfc3339()
             .build(),
-        simplelog::TerminalMode::Mixed,
-        simplelog::ColorChoice::Auto,
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
     )
     .expect("error initializing termlogger");
 
-    // Parse environment variables with trimming to avoid parsing errors
+    // Load environment variables with better error handling
     let api_id_str = env::var("API_ID").context("API_ID env is not set")?;
     let api_id = api_id_str.trim().parse::<i32>()
         .with_context(|| format!("Failed to parse API_ID: '{}'", api_id_str))?;
     let api_hash = env::var("API_HASH").context("API_HASH env is not set")?;
     let bot_token = env::var("BOT_TOKEN").context("BOT_TOKEN env is not set")?;
 
+    info!("Bot starting with API_ID: {}", api_id);
+
     static RECONNECTION_POLICY: &dyn ReconnectionPolicy = &FixedReconnect {
         attempts: 3,
         delay: Duration::from_secs(5),
     };
 
+    // Use /tmp for session file since Render's filesystem is ephemeral
     let config = Config {
         api_id,
         api_hash: api_hash.clone(),
-        session: Session::load_file_or_create("session.bin")?,
+        session: Session::load_file_or_create("/tmp/session.bin")?,
         params: InitParams {
             reconnection_policy: RECONNECTION_POLICY,
             ..Default::default()
@@ -57,44 +60,67 @@ async fn main() -> Result<()> {
         client.bot_sign_in(&bot_token).await?;
     }
 
-    client.session().save_to_file("session.bin")?;
+    client.session().save_to_file("/tmp/session.bin")?;
+    info!("Bot authorized successfully");
 
     let bot = Bot::new(client).await?;
 
-    // Bind an HTTP server to port from env or default 8080 (Render requirement)
-    let port_env = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let port = port_env.parse::<u16>().unwrap_or(8080);
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    info!("Listening on HTTP port {}", port);
+    // Start HTTP health check server for Render
+    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let port = port.parse::<u16>().unwrap_or(8080);
+    
+    let listener = TcpListener::bind(("0.0.0.0", port)).await
+        .with_context(|| format!("Failed to bind to port {}", port))?;
+    
+    info!("Health check server listening on port {}", port);
 
-    let bot_runner = tokio::spawn(bot.run());
+    let bot_runner = tokio::spawn(async move {
+        if let Err(e) = bot.run().await {
+            error!("Bot runner error: {}", e);
+        }
+    });
 
-    // Minimal HTTP server to respond 200 OK for any connection (Render health check)
-    let server = tokio::spawn(async move {
+    // Minimal HTTP server for health checks
+    let http_server = tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((mut socket, _addr)) => {
+                Ok((mut socket, addr)) => {
+                    info!("Health check from {}", addr);
+                    
                     tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buf = [0; 1024];
-                        let _ = socket.read(&mut buf).await;
-                        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                        let _ = socket.write_all(response.as_bytes()).await;
-                        let _ = socket.shutdown().await;
+                        let response = 
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: text/plain\r\n\
+                             Content-Length: 2\r\n\
+                             \r\n\
+                             OK";
+                        
+                        if let Err(e) = socket.write_all(response.as_bytes()).await {
+                            error!("Failed to write health response to {}: {}", addr, e);
+                        }
                     });
                 }
                 Err(e) => {
-                    log::error!("accept failed: {}", e);
+                    error!("Accept error: {}", e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
         }
     });
 
-    // Wait for bot or server tasks (server runs forever)
     tokio::select! {
-        _ = bot_runner => {},
-        _ = server => {},
+        result = bot_runner => {
+            if let Err(e) = result {
+                error!("Bot task failed: {}", e);
+            }
+        }
+        result = http_server => {
+            if let Err(e) = result {
+                error!("HTTP server task failed: {}", e);
+            }
+        }
     }
 
+    info!("Bot shutting down");
     Ok(())
 }

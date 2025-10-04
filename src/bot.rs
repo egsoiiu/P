@@ -1,10 +1,8 @@
 use std::{sync::Arc, time::Duration};
-use bytes::{Bytes, BytesMut};
-
 use anyhow::Result;
 use async_read_progress::TokioAsyncReadProgressExt;
 use dashmap::{DashMap, DashSet};
-use futures::TryStreamExt;
+use futures::{stream::once, StreamExt, TryStreamExt};
 use grammers_client::{
     button, reply_markup,
     types::{CallbackQuery, Chat, Message, User},
@@ -16,11 +14,11 @@ use scopeguard::defer;
 use stream_cancel::{Trigger, Valved};
 use tokio::sync::Mutex;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tokio_util::io::StreamReader;
+use bytes::Bytes;
 
 use crate::command::{parse_command, Command};
 
-/// Bot is the main struct of the bot.
-/// All the bot logic is implemented in this struct.
 #[derive(Debug)]
 pub struct Bot {
     client: Client,
@@ -32,7 +30,6 @@ pub struct Bot {
 }
 
 impl Bot {
-    /// Create a new bot instance.
     pub async fn new(client: Client) -> Result<Arc<Self>> {
         let me = client.get_me().await?;
         Ok(Arc::new(Self {
@@ -50,7 +47,6 @@ impl Bot {
         }))
     }
 
-    /// Run the bot.
     pub async fn run(self: Arc<Self>) {
         loop {
             tokio::select! {
@@ -61,7 +57,6 @@ impl Bot {
 
                 Ok(update) = self.client.next_update() => {
                     let self_ = self.clone();
-
                     tokio::spawn(async move {
                         if let Err(err) = self_.handle_update(update).await {
                             error!("Error handling update: {}", err);
@@ -72,7 +67,6 @@ impl Bot {
         }
     }
 
-    /// Update handler.
     async fn handle_update(&self, update: Update) -> Result<()> {
         match update {
             Update::NewMessage(msg) => self.handle_message(msg).await,
@@ -81,7 +75,6 @@ impl Bot {
         }
     }
 
-    /// Message handler.
     async fn handle_message(&self, msg: Message) -> Result<()> {
         match msg.chat() {
             Chat::User(_) | Chat::Group(_) => {}
@@ -124,7 +117,6 @@ impl Bot {
         Ok(())
     }
 
-    /// Handle the /start command.
     async fn handle_start(&self, msg: Message) -> Result<()> {
         msg.reply(InputMessage::html(
             "📁 <b>Hi! Need a file uploaded? Just send the link!</b>\n\
@@ -140,7 +132,6 @@ impl Bot {
         Ok(())
     }
 
-    /// Handle the /upload command.
     async fn handle_upload(&self, msg: Message, cmd: Command) -> Result<()> {
         let url = match cmd.arg {
             Some(url) => url,
@@ -161,7 +152,6 @@ impl Bot {
         self.handle_url(msg, url).await
     }
 
-    /// Handle a URL.
     async fn handle_url(&self, msg: Message, url: Url) -> Result<()> {
         let sender = match msg.sender() {
             Some(sender) => sender,
@@ -185,6 +175,7 @@ impl Bot {
 
         info!("Downloading file from {}", url);
 
+        // Send request and await response
         let response = self.http.get(url.clone()).send().await?;
 
         if !response.status().is_success() {
@@ -235,24 +226,32 @@ impl Bot {
 
         info!("File {} ({} bytes, video: {})", name, content_length, is_video);
 
-        if content_length == 0 {
+        // If content_length is 0, read the whole body bytes to check emptiness and create stream from it
+        let (stream, length) = if content_length == 0 {
             let body_bytes = response.bytes().await?;
             if body_bytes.is_empty() {
                 msg.reply("⚠️ File is empty").await?;
                 return Ok(());
             }
-        }
+            // Create a stream from the bytes for upload
+            (once(async { Ok::<_, std::io::Error>(body_bytes) }).boxed(), body_bytes.len())
+        } else {
+            // Use the bytes_stream for streaming if content_length>0
+            (
+                response
+                    .bytes_stream()
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+                    .boxed(),
+                content_length,
+            )
+        };
 
-        if content_length > 2 * 1024 * 1024 * 1024 {
+        if length > 2 * 1024 * 1024 * 1024 {
             msg.reply("⚠️ File is too large").await?;
             return Ok(());
         }
 
-        let (trigger, stream) = Valved::new(
-            response
-                .bytes_stream()
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
-        );
+        let (trigger, valved_stream) = Valved::new(stream);
         self.triggers.insert(msg.chat().id(), trigger);
 
         defer! {
@@ -272,41 +271,40 @@ impl Bot {
             .await?,
         ));
 
-        let mut stream = stream
-            .into_async_read()
-            .compat()
-            .report_progress(Duration::from_secs(3), |progress| {
-                let status = status.clone();
-                let name = name.clone();
-                let reply_markup = reply_markup.clone();
-                tokio::spawn(async move {
-                    status
-                        .lock()
-                        .await
-                        .edit(
-                            InputMessage::html(format!(
-                                "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
-                                 <i>{} / {}</i>",
-                                name,
-                                progress as f64 / content_length as f64 * 100.0,
-                                bytesize::to_string(progress as u64, true),
-                                bytesize::to_string(content_length as u64, true),
-                            ))
-                            .reply_markup(reply_markup.as_ref()),
-                        )
-                        .await
-                        .ok();
-                });
+        let mut async_reader = StreamReader::new(valved_stream).compat();
+
+        let mut stream = async_reader.report_progress(Duration::from_secs(3), |progress| {
+            let status = status.clone();
+            let name = name.clone();
+            let reply_markup = reply_markup.clone();
+            tokio::spawn(async move {
+                status
+                    .lock()
+                    .await
+                    .edit(
+                        InputMessage::html(format!(
+                            "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
+                             <i>{} / {}</i>",
+                            name,
+                            progress as f64 / length as f64 * 100.0,
+                            bytesize::to_string(progress as u64, true),
+                            bytesize::to_string(length as u64, true),
+                        ))
+                        .reply_markup(reply_markup.as_ref()),
+                    )
+                    .await
+                    .ok();
             });
+        });
 
         let start_time = chrono::Utc::now();
         let file = self
             .client
-            .upload_stream(&mut stream, content_length, name.clone())
+            .upload_stream(&mut stream, length, name.clone())
             .await?;
 
         let elapsed = chrono::Utc::now() - start_time;
-        info!("Uploaded file {} ({} bytes) in {}", name, content_length, elapsed);
+        info!("Uploaded file {} ({} bytes) in {}", name, length, elapsed);
 
         let mut input_msg = InputMessage::html(format!(
             "Uploaded in <b>{:.2} secs</b>",
@@ -329,7 +327,6 @@ impl Bot {
         Ok(())
     }
 
-    /// Callback query handler.
     async fn handle_callback(&self, query: CallbackQuery) -> Result<()> {
         match query.data() {
             b"cancel" => self.handle_cancel(query).await,
@@ -337,7 +334,6 @@ impl Bot {
         }
     }
 
-    /// Handle the cancel button.
     async fn handle_cancel(&self, query: CallbackQuery) -> Result<()> {
         let started_by_user_id = match self.started_by.get(&query.chat().id()) {
             Some(id) => *id,

@@ -1,4 +1,5 @@
 use std::{sync::Arc, time::Duration};
+use bytes::{Bytes, BytesMut}; // Add at the top if missing
 
 use anyhow::Result;
 use async_read_progress::TokioAsyncReadProgressExt;
@@ -202,10 +203,39 @@ impl Bot {
         };
 
         info!("Downloading file from {}", url);
-        let response = self.http.get(url).send().await?;
+        let response = self.http.get(url.clone()).send().await?;
 
-        // Get the file name and size
-        let length = response.content_length().unwrap_or_default() as usize;
+        // Read the file into memory and count the size
+        let mut total_bytes: usize = 0;
+        let mut chunks = response.bytes_stream();
+        let mut buffer_parts: Vec<bytes::Bytes> = Vec::new();
+
+        while let Some(chunk) = chunks.try_next().await? {
+            total_bytes += chunk.len();
+            buffer_parts.push(chunk);
+        }
+
+        if total_bytes == 0 {
+            msg.reply("⚠️ File is empty").await?;
+            return Ok(());
+        }
+
+        if total_bytes > 2 * 1024 * 1024 * 1024 {
+            msg.reply("⚠️ File is too large").await?;
+            return Ok(());
+        }
+
+        let full_bytes = buffer_parts
+            .into_iter()
+            .fold(bytes::BytesMut::new(), |mut acc, part| {
+                acc.extend_from_slice(&part);
+                acc
+            })
+            .freeze();
+
+        let mut reader = &full_bytes[..];
+
+        // Determine filename
         let name = match response
             .headers()
             .get("content-disposition")
@@ -223,68 +253,23 @@ impl Bot {
                     .map(|value| value.trim_matches('"'))
             }) {
             Some(name) => name.to_string(),
-            None => response
-                .url()
+            None => url
                 .path_segments()
                 .and_then(|segments| segments.last())
-                .and_then(|name| {
-                    if name.contains('.') {
-                        Some(name.to_string())
-                    } else {
-                        // guess the extension from the content type
-                        response
-                            .headers()
-                            .get("content-type")
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(mime_guess::get_mime_extensions_str)
-                            .and_then(|ext| ext.first())
-                            .map(|ext| format!("{}.{}", name, ext))
-                    }
-                })
-                .unwrap_or("file.bin".to_string())
+                .unwrap_or("file.bin")
                 .to_string(),
         };
+
         let name = percent_encoding::percent_decode_str(&name)
             .decode_utf8()?
             .to_string();
-        let is_video = response
-            .headers()
-            .get("content-type")
-            .map(|value| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| value.starts_with("video/mp4"))
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
-            || name.to_lowercase().ends_with(".mp4");
-        info!("File {} ({} bytes, video: {})", name, length, is_video);
 
-        // File is empty
-        if length == 0 {
-            msg.reply("⚠️ File is empty").await?;
-            return Ok(());
-        }
+        let is_video = name.to_lowercase().ends_with(".mp4");
 
-        // File is too large
-        if length > 2 * 1024 * 1024 * 1024 {
-            msg.reply("⚠️ File is too large").await?;
-            return Ok(());
-        }
-
-        // Wrap the response stream in a valved stream
-        let (trigger, stream) = Valved::new(
-            response
-                .bytes_stream()
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
+        info!(
+            "Prepared file {} ({} bytes, video: {})",
+            name, total_bytes, is_video
         );
-        self.triggers.insert(msg.chat().id(), trigger);
-
-        // Deferred trigger removal
-        defer! {
-            self.triggers.remove(&msg.chat().id());
-        };
 
         // Reply markup buttons
         let reply_markup = Arc::new(reply_markup::inline(vec![vec![button::inline(
@@ -301,51 +286,66 @@ impl Bot {
             .await?,
         ));
 
-        let mut stream = stream
-            .into_async_read()
-            .compat()
-            // Report progress every 3 seconds
-            .report_progress(Duration::from_secs(3), |progress| {
-                let status = status.clone();
-                let name = name.clone();
-                let reply_markup = reply_markup.clone();
-                tokio::spawn(async move {
-                    status
+        // Progress reporting (manual since stream isn't used)
+        let update_interval = Duration::from_secs(3);
+        let progress_task = {
+            let status = status.clone();
+            let name = name.clone();
+            let reply_markup = reply_markup.clone();
+            let total = total_bytes;
+            let uploaded = Arc::new(Mutex::new(0usize));
+            let uploaded_clone = uploaded.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(update_interval).await;
+                    let uploaded = *uploaded_clone.lock().await;
+
+                    if uploaded >= total {
+                        break;
+                    }
+
+                    let _ = status
                         .lock()
                         .await
                         .edit(
                             InputMessage::html(format!(
                                 "⏳ Uploading <code>{}</code> <b>({:.2}%)</b>\n\
-                            <i>{} / {}</i>",
+                                <i>{} / {}</i>",
                                 name,
-                                progress as f64 / length as f64 * 100.0,
-                                bytesize::to_string(progress as u64, true),
-                                bytesize::to_string(length as u64, true),
+                                uploaded as f64 / total as f64 * 100.0,
+                                bytesize::to_string(uploaded as u64, true),
+                                bytesize::to_string(total as u64, true),
                             ))
                             .reply_markup(reply_markup.as_ref()),
                         )
-                        .await
-                        .ok();
-                });
+                        .await;
+                }
             });
+
+            uploaded
+        };
 
         // Upload the file
         let start_time = chrono::Utc::now();
         let file = self
             .client
-            .upload_stream(&mut stream, length, name.clone())
+            .upload_stream(&mut reader, total_bytes, name.clone())
             .await?;
 
-        // Calculate upload time
-        let elapsed = chrono::Utc::now() - start_time;
-        info!("Uploaded file {} ({} bytes) in {}", name, length, elapsed);
+        // Finish progress
+        *progress_task.lock().await = total_bytes;
 
-        // Send file
+        let elapsed = chrono::Utc::now() - start_time;
+        info!("Uploaded file {} ({} bytes) in {}", name, total_bytes, elapsed);
+
+        // Send file to Telegram
         let mut input_msg = InputMessage::html(format!(
-            "Uploaded in <b>{:.2} secs</b>",
+            "✅ Uploaded in <b>{:.2} secs</b>",
             elapsed.num_milliseconds() as f64 / 1000.0
-        ));
-        input_msg = input_msg.document(file);
+        ))
+        .document(file);
+
         if is_video {
             input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
                 supports_streaming: false,
@@ -355,6 +355,7 @@ impl Bot {
                 round_message: false,
             });
         }
+
         msg.reply(input_msg).await?;
 
         // Delete status message
